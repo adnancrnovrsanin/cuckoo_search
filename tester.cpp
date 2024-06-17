@@ -77,7 +77,7 @@ int main()
         for (const auto &numThreads : threads)
         {
             std::vector<double> execTimes;
-            for (int i = 0; i < 5; ++i) // Repeat 5 times
+            for (int i = 0; i < 30; ++i) // Run 30 times
             {
                 std::string command = "cmd /c \"set OMP_NUM_THREADS=" + std::to_string(numThreads) + " && cuckoo_search " + std::to_string(numThreads) + " " + benchmark + " " + detailedLogFilename + "\"";
                 std::cout << "Running: " << command << std::endl;
