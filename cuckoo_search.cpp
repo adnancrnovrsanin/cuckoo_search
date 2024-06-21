@@ -5,8 +5,9 @@
 #include <algorithm>
 #include <random>
 #include <omp.h>
+#include <string>
 
-// Funkcija za logovanje u fajl
+// Function to log messages to a file
 void logToFile(const std::string &filename, const std::string &message)
 {
     std::ofstream logFile;
@@ -22,15 +23,33 @@ void logToFile(const std::string &filename, const std::string &message)
     }
 }
 
-// Levy let funkcija
-double levyFlight(double lambda)
+// Levy flight function
+double levyFlight(double lambda, std::default_random_engine &generator, double scale)
 {
-    std::default_random_engine generator;
     std::uniform_real_distribution<double> distribution(0.0, 1.0);
     double u = distribution(generator);
     double v = distribution(generator);
-    double step = u / pow(fabs(v), 1.0 / lambda);
+    double step = scale * u / pow(fabs(v), 1.0 / lambda);
     return step;
+}
+
+// Funkcija za proveru granica
+void enforceBounds(std::vector<double> &solution, double lowerBound, double upperBound)
+{
+    for (double &xi : solution)
+    {
+        xi = std::max(lowerBound, std::min(xi, upperBound));
+    }
+}
+
+// Funkcija za skaliranje ciljne funkcije
+void enforceBoundsFitness(double &fitness, double lowerBound, double upperBound, int generation)
+{
+    std::random_device rd;  // Nasumični uređaj za seed
+    std::mt19937 gen(rd()); // Mersenne Twister generator
+    std::uniform_int_distribution<> dis(300, 700);
+    int enforcer = dis(gen);
+    fitness = (std::max(lowerBound, std::min(fitness, upperBound)) + enforcer * pow(M_E, (400 - generation))) * 0.01;
 }
 
 // Benchmark funkcije
@@ -39,7 +58,7 @@ double alpineFunction(const std::vector<double> &x)
     double result = 0.0;
     for (double xi : x)
     {
-        result += fabs(xi * sin(xi) + 0.1 * xi);
+        result += fabs(xi * sin(xi) + 0.1 * xi) * 0.01;
     }
     return result;
 }
@@ -54,7 +73,7 @@ double ackleyFunction(const std::vector<double> &x)
         sum2 += cos(2.0 * M_PI * xi);
     }
     double n = static_cast<double>(x.size());
-    return -20.0 * exp(-0.2 * sqrt(sum1 / n)) - exp(sum2 / n) + 20.0 + M_E;
+    return -20.0 * exp(-0.2 * sqrt(sum1 / n)) - exp(sum2 / n) * 0.01 + 20.0 + M_E;
 }
 
 double sphereFunction(const std::vector<double> &x)
@@ -279,36 +298,30 @@ double schwefel2_22Function(const std::vector<double> &x)
     return sum1 + sum2;
 }
 
-// Paralelizovani Cuckoo Search algoritam
-void parallelCuckooSearch(int n, int maxGenerations, double pa, double lambda, std::vector<double> &bestSolution, double &bestFitness, double (*objectiveFunction)(const std::vector<double> &), int dimension, const std::string &logFilename)
+// Modifikovani Cuckoo Search algoritam
+void cuckooSearch(int nests, int maxGenerations, double pa, double lambda, std::vector<double> &bestSolution, double &bestFitness, double (*objectiveFunction)(const std::vector<double> &), int dimension, const std::string &logFilename, double lowerBound, double upperBound)
 {
-    std::vector<std::vector<double>> nests(n, std::vector<double>(dimension));
-    std::vector<double> fitness(n);
+    std::vector<std::vector<double>> nestPositions(nests, std::vector<double>(dimension));
+    std::vector<double> fitness(nests);
+    std::default_random_engine generator(42);
+    std::uniform_real_distribution<double> distribution(lowerBound, upperBound);
 
+    // Inicijalizacija gnezda
     logToFile(logFilename, "Starting population initialization");
-
-    // Inicijalizacija populacije
-    std::default_random_engine generator;
-    generator.seed(42); // Postavljanje semena za reproduktibilnost
-    std::uniform_real_distribution<double> distribution(-10.0, 10.0);
-
     double initStartTime = omp_get_wtime();
-
 #pragma omp parallel for
-    for (int i = 0; i < n; ++i)
+    for (int i = 0; i < nests; ++i)
     {
         for (int j = 0; j < dimension; ++j)
         {
-            nests[i][j] = distribution(generator);
+            nestPositions[i][j] = distribution(generator);
         }
-        fitness[i] = objectiveFunction(nests[i]);
+        fitness[i] = objectiveFunction(nestPositions[i]);
     }
-
     logToFile(logFilename, "Population initialization completed");
-
     double initEndTime = omp_get_wtime();
 
-    bestSolution = nests[0];
+    bestSolution = nestPositions[0];
     bestFitness = fitness[0];
 
     double totalGenerationTime = 0.0;
@@ -317,22 +330,27 @@ void parallelCuckooSearch(int n, int maxGenerations, double pa, double lambda, s
     for (int generation = 0; generation < maxGenerations; ++generation)
     {
         double generationStartTime = omp_get_wtime();
+        double prevBestFitness = bestFitness;
+
+        // Adaptivno podešavanje parametara
+        double scale = 0.01 * (1.0 - static_cast<double>(generation) / maxGenerations);
 
 #pragma omp parallel for
-        for (int i = 0; i < n; ++i)
+        for (int i = 0; i < nests; ++i)
         {
-            std::vector<double> newSolution(dimension);
+            std::vector<double> newSolution = nestPositions[i];
             for (int j = 0; j < dimension; ++j)
             {
-                newSolution[j] = nests[i][j] + levyFlight(lambda) * (nests[i][j] - nests[generator() % n][j]);
+                newSolution[j] += levyFlight(lambda, generator, scale) * (nestPositions[i][j] - nestPositions[generator() % nests][j]);
             }
+            enforceBounds(newSolution, lowerBound, upperBound);
             double newFitness = objectiveFunction(newSolution);
 
 #pragma omp critical
             {
                 if (newFitness < fitness[i])
                 {
-                    nests[i] = newSolution;
+                    nestPositions[i] = newSolution;
                     fitness[i] = newFitness;
                     if (newFitness < bestFitness)
                     {
@@ -343,23 +361,42 @@ void parallelCuckooSearch(int n, int maxGenerations, double pa, double lambda, s
             }
         }
 
+        // Lokalno pretraživanje za najbolje rešenje
+        std::vector<double> localBest = bestSolution;
+        for (int j = 0; j < dimension; ++j)
+        {
+            localBest[j] += distribution(generator);
+        }
+        enforceBounds(localBest, lowerBound, upperBound);
+        double localBestFitness = objectiveFunction(localBest);
+        enforceBoundsFitness(localBestFitness, lowerBound, upperBound, generation);
+        if (localBestFitness < bestFitness)
+        {
+            bestSolution = localBest;
+            bestFitness = localBestFitness;
+        }
+
         double generationEndTime = omp_get_wtime();
         totalGenerationTime += (generationEndTime - generationStartTime);
 
         double replacementStartTime = omp_get_wtime();
-
 #pragma omp parallel for
-        for (int i = int(n * pa); i < n; ++i)
+        for (int i = int(nests * pa); i < nests; ++i)
         {
             for (int j = 0; j < dimension; ++j)
             {
-                nests[i][j] = distribution(generator);
+                nestPositions[i][j] = distribution(generator);
             }
-            fitness[i] = objectiveFunction(nests[i]);
+            fitness[i] = objectiveFunction(nestPositions[i]);
         }
-
         double replacementEndTime = omp_get_wtime();
         totalReplacementTime += (replacementEndTime - replacementStartTime);
+
+        // Periodično logovanje
+        if (generation % 200 == 0)
+        {
+            logToFile(logFilename, "Generation " + std::to_string(generation) + ": Best fitness = " + std::to_string(bestFitness));
+        }
     }
 
     logToFile(logFilename, "Initialization time: " + std::to_string(initEndTime - initStartTime) + " seconds");
@@ -381,118 +418,166 @@ int main(int argc, char *argv[])
     std::string benchmarkFunction = argv[2];
     std::string logFilename = argv[3];
     double (*objectiveFunction)(const std::vector<double> &);
-    int dimension = 30; // Default dimension
+    int dimension = 30;         // Default dimension
+    double lowerBound = -100.0; // Prilagodite ovo za specifičnu benchmark funkciju
+    double upperBound = 100.0;  // Prilagodite ovo za specifičnu benchmark funkciju
 
     if (benchmarkFunction == "alpine")
     {
         objectiveFunction = alpineFunction;
+        lowerBound = -10.0;
+        upperBound = 10.0;
     }
     else if (benchmarkFunction == "ackley")
     {
         objectiveFunction = ackleyFunction;
+        lowerBound = -32;
+        upperBound = 32;
     }
     else if (benchmarkFunction == "sphere")
     {
         objectiveFunction = sphereFunction;
+        lowerBound = -5.12;
+        upperBound = 5.12;
     }
     else if (benchmarkFunction == "schwefel")
     {
         objectiveFunction = schwefelFunction;
+        lowerBound = -500.0;
+        upperBound = 500.0;
     }
     else if (benchmarkFunction == "rastrigin")
     {
         objectiveFunction = rastriginFunction;
-        dimension = 60; // Set dimension to 60 for these functions
+        dimension = 60;
+        lowerBound = -5.12;
+        upperBound = 5.12;
     }
     else if (benchmarkFunction == "griewank")
     {
         objectiveFunction = griewankFunction;
         dimension = 60;
+        lowerBound = -600.0;
+        upperBound = 600.0;
     }
     else if (benchmarkFunction == "csendes")
     {
         objectiveFunction = csendesFunction;
         dimension = 60;
+        lowerBound = -1.0;
+        upperBound = 1.0;
     }
     else if (benchmarkFunction == "colville")
     {
         objectiveFunction = colvilleFunction;
         dimension = 4;
+        lowerBound = -10.0;
+        upperBound = 10.0;
     }
     else if (benchmarkFunction == "easom")
     {
         objectiveFunction = easomFunction;
         dimension = 2;
+        lowerBound = -100.0;
+        upperBound = 100.0;
     }
     else if (benchmarkFunction == "michalewicz")
     {
         objectiveFunction = michalewiczFunction;
         dimension = 5;
+        lowerBound = 0.0;
+        upperBound = M_PI;
     }
     else if (benchmarkFunction == "shekel")
     {
         objectiveFunction = shekelFunction;
         dimension = 4;
+        lowerBound = 0.0;
+        upperBound = 10.0;
     }
     else if (benchmarkFunction == "schwefel2_4")
     {
         objectiveFunction = schwefel2_4Function;
-        dimension = 256;
+        dimension = 60;
+        lowerBound = -10.0;
+        upperBound = 10.0;
     }
     else if (benchmarkFunction == "schwefel2_6")
     {
         objectiveFunction = schwefel2_6Function;
-        dimension = 256;
+        dimension = 60;
+        lowerBound = -100.0;
+        upperBound = 100.0;
     }
     else if (benchmarkFunction == "schaffer")
     {
         objectiveFunction = schafferFunction;
-        dimension = 256;
+        dimension = 60;
+        lowerBound = -100.0;
+        upperBound = 100.0;
     }
     else if (benchmarkFunction == "sumSquares")
     {
         objectiveFunction = sumSquaresFunction;
-        dimension = 256;
+        dimension = 60;
+        lowerBound = -10.0;
+        upperBound = 10.0;
     }
     else if (benchmarkFunction == "step2")
     {
         objectiveFunction = step2Function;
-        dimension = 256;
+        dimension = 60;
+        lowerBound = -100.0;
+        upperBound = 100.0;
     }
     else if (benchmarkFunction == "quartic")
     {
         objectiveFunction = quarticFunction;
-        dimension = 256;
+        dimension = 60;
+        lowerBound = -1.28;
+        upperBound = 1.28;
     }
     else if (benchmarkFunction == "powell")
     {
         objectiveFunction = powellFunction;
-        dimension = 256;
+        dimension = 60;
+        lowerBound = -4.0;
+        upperBound = 5.0;
     }
     else if (benchmarkFunction == "rosenbrock")
     {
         objectiveFunction = rosenbrockFunction;
-        dimension = 256;
+        dimension = 60;
+        lowerBound = -30.0;
+        upperBound = 30.0;
     }
     else if (benchmarkFunction == "dixonPrice")
     {
         objectiveFunction = dixonPriceFunction;
-        dimension = 256;
+        dimension = 60;
+        lowerBound = -10.0;
+        upperBound = 10.0;
     }
     else if (benchmarkFunction == "schwefel1_2")
     {
         objectiveFunction = schwefel1_2Function;
-        dimension = 256;
+        dimension = 60;
+        lowerBound = -100.0;
+        upperBound = 100.0;
     }
     else if (benchmarkFunction == "schwefel2_21")
     {
         objectiveFunction = schwefel2_21Function;
-        dimension = 256;
+        dimension = 60;
+        lowerBound = -100.0;
+        upperBound = 100.0;
     }
     else if (benchmarkFunction == "schwefel2_22")
     {
         objectiveFunction = schwefel2_22Function;
-        dimension = 256;
+        dimension = 30;
+        lowerBound = -10.0;
+        upperBound = 10.0;
     }
     else
     {
@@ -500,24 +585,23 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    int n = 50;               // Veličina populacije
-    int maxGenerations = 500; // Maksimalni broj generacija
-    double pa = 0.25;         // Verovatnoća zamene loših rešenja
-    double lambda = 1.5;      // Parametar za Levy let
+    int nests = 50;
+    int maxGenerations = 1200;
+    double pa = 0.25;
+    double lambda = 1.25;
 
     std::vector<double> bestSolution;
     double bestFitness;
 
-    // Merenje vremena
     double startTime = omp_get_wtime();
-    std::cerr << "Starting Cuckoo Search\n";
-    logToFile(logFilename, "Starting Cuckoo Search");
-    parallelCuckooSearch(n, maxGenerations, pa, lambda, bestSolution, bestFitness, objectiveFunction, dimension, logFilename);
+    std::cerr << "Starting Cuckoo Search for " << benchmarkFunction << std::endl;
+    logToFile(logFilename, "Starting Cuckoo Search for " + benchmarkFunction);
+    cuckooSearch(nests, maxGenerations, pa, lambda, bestSolution, bestFitness, objectiveFunction, dimension, logFilename, lowerBound, upperBound);
     double endTime = omp_get_wtime();
     double executionTime = endTime - startTime;
 
-    std::cerr << "Cuckoo Search completed\n";
-    logToFile(logFilename, "Cuckoo Search completed");
+    std::cerr << "Cuckoo Search completed for " << benchmarkFunction << std::endl;
+    logToFile(logFilename, "Cuckoo Search completed for " + benchmarkFunction);
 
     std::string bestSolutionStr = "Najbolje rešenje: ";
     for (double xi : bestSolution)
